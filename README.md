@@ -3,7 +3,7 @@
 tl;dr: pipeline for finetuning a model to convert images of sheet music into ABC notation. 
 
 # data
-data is scraped from [musescore](https://musescore.com/sheetmusic) using a custom scraper. The scraper downloads the sheet music as MusicXML and stores it on the the local filesystem. The dataloader then converts the MusicXML into both an image and a corresponding ABC notation string.
+data is scraped from [musescore](https://musescore.com/sheetmusic) using a custom scraper. The scraper downloads the sheet music as both ABC and a set of images corresponding to pages
 
 # scraping
 
