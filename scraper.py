@@ -1,5 +1,6 @@
 import argparse
 import json
+import logging
 import os
 import sys
 import zipfile
@@ -18,6 +19,7 @@ from playwright.sync_api import Page, sync_playwright
 LOGIN_URL = "https://www.musescore.com"
 SHEET_MUSIC_URL = "https://musescore.com/sheetmusic/free-download"
 HEADLESS = True
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -130,6 +132,12 @@ def head_worker(config: ScraperConfig, queue: Queue, email: str, password: str):
                 score_metadata = parse_metadata(meta, full_link)
                 queue.put(score_metadata)
                 metadata["scores"].append(score_metadata)
+                logger.info(
+                    "head queued score %s/%s: %s",
+                    n_collected_links + i + 1,
+                    config.num_scores,
+                    full_link,
+                )
             n_collected_links += n
             current_page += 1
             NEXT_URL = SHEET_MUSIC_URL + "?page=" + str(current_page)
@@ -142,7 +150,13 @@ def head_worker(config: ScraperConfig, queue: Queue, email: str, password: str):
         playwright.stop()
 
 
-def scraper_worker(config: ScraperConfig, queue: Queue, email: str, password: str):
+def scraper_worker(
+    config: ScraperConfig,
+    queue: Queue,
+    email: str,
+    password: str,
+    worker_id: int,
+):
     playwright = sync_playwright().start()
     browser = playwright.chromium.launch(headless=HEADLESS)
     page = browser.new_page()
@@ -193,6 +207,7 @@ def scraper_worker(config: ScraperConfig, queue: Queue, email: str, password: st
                 img.save(config.output_dir / score_id / f"page_{i + 1}.png", "PNG")
             os.remove(config.output_dir / f"{score_id}.pdf")
             os.remove(config.output_dir / f"{score_id}.xml")
+            logger.info("worker worker-%s scraped %s", worker_id, score_id)
             next_score = queue.get()
     finally:
         browser.close()
@@ -200,6 +215,7 @@ def scraper_worker(config: ScraperConfig, queue: Queue, email: str, password: st
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     config = parse_args()
     # abc_xml_converter parses global sys.argv internally; clear scraper CLI args first.
     sys.argv = [sys.argv[0]]
@@ -211,8 +227,8 @@ def main():
         queue: Queue = Queue()
         futures = [executor.submit(head_worker, config, queue, email, password)]
         futures.extend(
-            executor.submit(scraper_worker, config, queue, email, password)
-            for _ in range(config.num_workers)
+            executor.submit(scraper_worker, config, queue, email, password, i + 1)
+            for i in range(config.num_workers)
         )
         for future in futures:
             future.result()
