@@ -13,6 +13,7 @@ from unsloth.trainer import UnslothVisionDataCollator
 MODEL_NAME = "unsloth/Qwen3-VL-8B-Instruct-unsloth-bnb-4bit"
 MAX_SEQUENCE_LENGTH = 2048
 PROMPT_TEXT = "Convert the following sheet music into ABC notation:"
+EVAL_SPLIT_RATIO = 0.1
 
 
 def format_train_sample(images: List[ImageFile], abc_notation: str) -> Dict[str, Any]:
@@ -45,7 +46,7 @@ def format_eval_sample(images: List[ImageFile]) -> Dict[str, Any]:
     return {"messages": conversation}
 
 
-def load_dataset(path: Path) -> List[Dict[str, Any]]:
+def _load_metadata_records(path: Path) -> List[Dict[str, Any]]:
     with (path / "metadata.json").open("r", encoding="utf-8") as file:
         metadata = json.load(file)
 
@@ -54,24 +55,62 @@ def load_dataset(path: Path) -> List[Dict[str, Any]]:
     else:
         records = metadata
 
+    if not isinstance(records, list):
+        raise ValueError(
+            "metadata.json must contain a list of records or {'scores': [...]}"
+        )
+    return records
+
+
+def load_dataset(path: Path) -> List[Dict[str, Any]]:
+    records = _load_metadata_records(path)
+
     dataset: List[Dict[str, Any]] = []
     for item in records:
-        score_id = item["score_id"]
+        score_id = str(item["score_id"])
+        saves = int(item.get("saves", 0))
+        pages = int(item["pages"])
         example_path = path / score_id
         images: List[ImageFile] = []
-        for i in range(1, item["pages"] + 1):
+        for i in range(1, pages + 1):
             image_path = example_path / f"page_{i}.png"
-            images.append(Image.open(image_path).convert("RGB"))
+            with Image.open(image_path) as image:
+                images.append(image.convert("RGB"))
 
         abc_notation = (example_path / f"{score_id}.abc").read_text(encoding="utf-8")
         dataset.append(
             {
                 "score_id": score_id,
+                "saves": saves,
                 "images": images,
                 "abc_notation": abc_notation,
             }
         )
     return dataset
+
+
+def split_dataset(
+    examples: List[Dict[str, Any]],
+    eval_split_ratio: float = EVAL_SPLIT_RATIO,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    if not 0 <= eval_split_ratio < 1:
+        raise ValueError("eval_split_ratio must be in the range [0, 1).")
+    if not examples:
+        return [], []
+
+    ranked_examples = sorted(
+        examples,
+        key=lambda example: (-int(example.get("saves", 0)), str(example["score_id"])),
+    )
+
+    eval_size = int(len(ranked_examples) * eval_split_ratio)
+    if len(ranked_examples) >= 2:
+        eval_size = max(1, eval_size)
+        eval_size = min(eval_size, len(ranked_examples) - 1)
+
+    eval_examples = ranked_examples[:eval_size]
+    train_examples = ranked_examples[eval_size:]
+    return train_examples, eval_examples
 
 
 def build_train_dataset(examples: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -238,7 +277,16 @@ def get_model_and_tokenizer():
 def main():
     model, tokenizer = get_model_and_tokenizer()
     examples = load_dataset(Path("data"))
-    train_dataset = build_train_dataset(examples)
+    train_examples, eval_examples = split_dataset(examples)
+
+    if not train_examples:
+        raise ValueError("No training examples were found after splitting.")
+
+    print(
+        f"Loaded {len(train_examples)} train examples and "
+        f"{len(eval_examples)} eval examples (top {int(EVAL_SPLIT_RATIO * 100)}% by saves)."
+    )
+    train_dataset = build_train_dataset(train_examples)
 
     FastVisionModel.for_training(model)
     trainer = SFTTrainer(
@@ -268,7 +316,11 @@ def main():
 
     trainer.train()
 
-    metrics = eval(model, tokenizer, examples)
+    if not eval_examples:
+        print("No evaluation examples available after split; skipping evaluation.")
+        return
+
+    metrics = eval(model, tokenizer, eval_examples)
     print(
         "Eval metrics | "
         f"mean_levenshtein_distance={metrics['mean_levenshtein_distance']:.4f}, "
