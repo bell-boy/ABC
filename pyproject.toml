@@ -8,6 +8,7 @@ dependencies = [
     "abc-xml-converter>=1.0.1",
     "argparse>=1.4.0",
     "pdf2image>=1.17.0",
+    "playwright-stealth>=2.0.2",
     "playwright>=1.58.0",
     "python-dotenv>=1.2.1",
     "trl>=0.24.0",

@@ -3,22 +3,41 @@ import json
 import logging
 import os
 import sys
+import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from queue import Queue
-from typing import Dict, List
+from threading import Lock
+from typing import Dict, List, Optional
 from urllib.parse import urljoin
 
 from abc_xml_converter import convert_xml2abc
 from dotenv import load_dotenv
 from pdf2image import convert_from_path
-from playwright.sync_api import Page, sync_playwright
+from playwright.sync_api import (
+    Browser,
+    BrowserContext,
+    Page,
+    Playwright,
+    sync_playwright,
+)
+from playwright_stealth import Stealth
+from tqdm import tqdm
 
 LOGIN_URL = "https://www.musescore.com"
 SHEET_MUSIC_URL = "https://musescore.com/sheetmusic/free-download"
 HEADLESS = True
+CLOUDFLARE_POLL_INTERVAL_MS = 1500
+CLOUDFLARE_MAX_WAIT_MS = 45000
+BROWSER_CONTEXT_OPTIONS = {
+    "locale": "en-US",
+    "timezone_id": "America/New_York",
+    "viewport": {"width": 1366, "height": 768},
+    "color_scheme": "light",
+}
 logger = logging.getLogger(__name__)
 
 
@@ -64,8 +83,73 @@ def get_login_credentials():
     return login_email, login_password
 
 
+def setup_logging(output_dir: Path) -> Path:
+    log_path = output_dir / "scraper.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(threadName)s] %(message)s",
+        handlers=[logging.FileHandler(log_path, encoding="utf-8")],
+        force=True,
+    )
+    return log_path
+
+
+def create_stealth() -> Stealth:
+    return Stealth(
+        navigator_languages_override=("en-US", "en"),
+        navigator_platform_override="Win32",
+    )
+
+
+def create_browser_page(playwright: Playwright) -> tuple[Browser, BrowserContext, Page]:
+    browser = playwright.chromium.launch(headless=HEADLESS)
+    context = browser.new_context(**BROWSER_CONTEXT_OPTIONS)
+    page = context.new_page()
+    return browser, context, page
+
+
+def is_cloudflare_challenge(page: Page) -> bool:
+    if (
+        "challenges.cloudflare.com" in page.url
+        or "/cdn-cgi/challenge-platform/" in page.url
+    ):
+        return True
+    markers = (
+        "text=Checking your browser before accessing",
+        "text=Just a moment...",
+        "iframe[src*='challenges.cloudflare.com']",
+        "input[name='cf-turnstile-response']",
+    )
+    return any(page.locator(marker).count() > 0 for marker in markers)
+
+
+def wait_for_cloudflare_clearance(
+    page: Page, timeout_ms: int = CLOUDFLARE_MAX_WAIT_MS
+) -> None:
+    if not is_cloudflare_challenge(page):
+        return
+
+    logger.info(
+        "Cloudflare challenge detected at %s; waiting up to %ss",
+        page.url,
+        timeout_ms // 1000,
+    )
+    deadline = time.monotonic() + (timeout_ms / 1000)
+    while time.monotonic() < deadline:
+        if not is_cloudflare_challenge(page):
+            logger.info("Cloudflare challenge cleared.")
+            return
+        page.wait_for_timeout(CLOUDFLARE_POLL_INTERVAL_MS)
+    raise TimeoutError(f"Cloudflare challenge did not clear: {page.url}")
+
+
+def navigate(page: Page, url: str, wait_until: str = "domcontentloaded") -> None:
+    page.goto(url, wait_until=wait_until)
+    wait_for_cloudflare_clearance(page)
+
+
 def login(page: Page, email: str, password: str) -> None:
-    page.goto(LOGIN_URL)
+    navigate(page, LOGIN_URL)
     page.wait_for_selector(
         "button[class='TtlUw TtlUw DHBDz HFvdW plVkZ wXNik utani u_VDg']"
     )
@@ -104,50 +188,56 @@ def parse_metadata(meta_str: List[str], link: str) -> Dict[str, object]:
 
 
 def head_worker(config: ScraperConfig, queue: Queue, email: str, password: str):
-    playwright = sync_playwright().start()
-    browser = playwright.chromium.launch(headless=HEADLESS)
-    page = browser.new_page()
+    browser: Optional[Browser] = None
+    context: Optional[BrowserContext] = None
     NEXT_URL = SHEET_MUSIC_URL
     current_page = 1
     n_collected_links = 0
 
     metadata = {"scores": []}
     try:
-        login(page, email, password)
-        while n_collected_links < config.num_scores:
-            page.goto(NEXT_URL)
+        stealth = create_stealth()
+        with stealth.use_sync(sync_playwright()) as playwright:
+            browser, context, page = create_browser_page(playwright)
+            login(page, email, password)
+            while n_collected_links < config.num_scores:
+                navigate(page, NEXT_URL)
 
-            page.wait_for_selector("div[class='OAIWc']")
-            scores = page.locator("div[class='OAIWc']")
-            n = min(scores.count(), config.num_scores - n_collected_links)
-            for i in range(n):
-                div = scores.nth(i)
-                a = div.locator("a").first
-                link = a.get_attribute("href")
-                if not link:
-                    raise ValueError("Link not found for score")
-                full_link = urljoin(LOGIN_URL, link)
-                meta = div.locator("span.AZHap").inner_text().split("•")
-                meta = [m.strip() for m in meta]
-                score_metadata = parse_metadata(meta, full_link)
-                queue.put(score_metadata)
-                metadata["scores"].append(score_metadata)
-                logger.info(
-                    "head queued score %s/%s: %s",
-                    n_collected_links + i + 1,
-                    config.num_scores,
-                    full_link,
-                )
-            n_collected_links += n
-            current_page += 1
-            NEXT_URL = SHEET_MUSIC_URL + "?page=" + str(current_page)
-        with open(config.output_dir / "metadata.json", "w", encoding="utf-8") as fp:
-            json.dump(metadata, fp, indent=4)
+                page.wait_for_selector("div[class='OAIWc']")
+                scores = page.locator("div[class='OAIWc']")
+                n = min(scores.count(), config.num_scores - n_collected_links)
+                for i in range(n):
+                    div = scores.nth(i)
+                    a = div.locator("a").first
+                    link = a.get_attribute("href")
+                    if not link:
+                        raise ValueError("Link not found for score")
+                    full_link = urljoin(LOGIN_URL, link)
+                    meta = div.locator("span.AZHap").inner_text().split("•")
+                    meta = [m.strip() for m in meta]
+                    score_metadata = parse_metadata(meta, full_link)
+                    queue.put(score_metadata)
+                    metadata["scores"].append(score_metadata)
+                    logger.info(
+                        "head queued score %s/%s: %s",
+                        n_collected_links + i + 1,
+                        config.num_scores,
+                        full_link,
+                    )
+                n_collected_links += n
+                current_page += 1
+                NEXT_URL = SHEET_MUSIC_URL + "?page=" + str(current_page)
+            with open(config.output_dir / "metadata.json", "w", encoding="utf-8") as fp:
+                json.dump(metadata, fp, indent=4)
     finally:
         for _ in range(config.num_workers):
             queue.put(None)  # Sentinel to signal workers to stop
-        browser.close()
-        playwright.stop()
+        with suppress(Exception):
+            if context is not None:
+                context.close()
+        with suppress(Exception):
+            if browser is not None:
+                browser.close()
 
 
 def scraper_worker(
@@ -156,82 +246,109 @@ def scraper_worker(
     email: str,
     password: str,
     worker_id: int,
+    progress: tqdm,
+    progress_lock: Lock,
 ):
-    playwright = sync_playwright().start()
-    browser = playwright.chromium.launch(headless=HEADLESS)
-    page = browser.new_page()
+    browser: Optional[Browser] = None
+    context: Optional[BrowserContext] = None
     try:
-        login(page, email, password)
-        next_score = queue.get()
-        while next_score is not None:
-            metadata = next_score
-            link = str(metadata["link"])
-            score_id = str(metadata["score_id"])
-
-            os.makedirs(config.output_dir / score_id, exist_ok=True)
-
-            page.goto(link, wait_until="domcontentloaded")
-            page.wait_for_selector("button[name='download']")
-
-            page.click("button[name='download']")
-            with page.expect_download() as download_info:
-                page.click("text=MusicXML")
-            xml_zip_path = config.output_dir / f"{score_id}.xml.zip"
-            xml_path = config.output_dir / f"{score_id}.xml"
-            download_info.value.save_as(xml_zip_path)
-            with zipfile.ZipFile(xml_zip_path) as archive:
-                xml_member = next(
-                    name
-                    for name in archive.namelist()
-                    if name.lower().endswith((".xml", ".musicxml"))
-                    and not name.lower().startswith("meta-inf/")
-                )
-                with archive.open(xml_member) as src, open(xml_path, "wb") as dst:
-                    dst.write(src.read())
-            os.remove(xml_zip_path)
-
-            convert_xml2abc(
-                file_to_convert=str(xml_path),
-                output_directory=str(config.output_dir / score_id),
-            )
-
-            page.goto(link, wait_until="domcontentloaded")
-            page.wait_for_selector("button[name='download']")
-
-            page.click("button[name='download']")
-            with page.expect_download() as download_info:
-                page.click("text=PDF")
-            download_info.value.save_as(config.output_dir / f"{score_id}.pdf")
-            images = convert_from_path(config.output_dir / f"{score_id}.pdf")
-            for i, img in enumerate(images):
-                img.save(config.output_dir / score_id / f"page_{i + 1}.png", "PNG")
-            os.remove(config.output_dir / f"{score_id}.pdf")
-            os.remove(config.output_dir / f"{score_id}.xml")
-            logger.info("worker worker-%s scraped %s", worker_id, score_id)
+        stealth = create_stealth()
+        with stealth.use_sync(sync_playwright()) as playwright:
+            browser, context, page = create_browser_page(playwright)
+            login(page, email, password)
             next_score = queue.get()
+            while next_score is not None:
+                metadata = next_score
+                link = str(metadata["link"])
+                score_id = str(metadata["score_id"])
+
+                os.makedirs(config.output_dir / score_id, exist_ok=True)
+
+                navigate(page, link)
+                page.wait_for_selector("button[name='download']")
+
+                page.click("button[name='download']")
+                with page.expect_download() as download_info:
+                    page.click("text=MusicXML")
+                xml_zip_path = config.output_dir / f"{score_id}.xml.zip"
+                xml_path = config.output_dir / f"{score_id}.xml"
+                download_info.value.save_as(xml_zip_path)
+                with zipfile.ZipFile(xml_zip_path) as archive:
+                    xml_member = next(
+                        name
+                        for name in archive.namelist()
+                        if name.lower().endswith((".xml", ".musicxml"))
+                        and not name.lower().startswith("meta-inf/")
+                    )
+                    with archive.open(xml_member) as src, open(xml_path, "wb") as dst:
+                        dst.write(src.read())
+                os.remove(xml_zip_path)
+
+                convert_xml2abc(
+                    file_to_convert=str(xml_path),
+                    output_directory=str(config.output_dir / score_id),
+                )
+
+                navigate(page, link)
+                page.wait_for_selector("button[name='download']")
+
+                page.click("button[name='download']")
+                with page.expect_download() as download_info:
+                    page.click("text=PDF")
+                download_info.value.save_as(config.output_dir / f"{score_id}.pdf")
+                images = convert_from_path(config.output_dir / f"{score_id}.pdf")
+                for i, img in enumerate(images):
+                    img.save(config.output_dir / score_id / f"page_{i + 1}.png", "PNG")
+                os.remove(config.output_dir / f"{score_id}.pdf")
+                os.remove(config.output_dir / f"{score_id}.xml")
+                logger.info("worker worker-%s scraped %s", worker_id, score_id)
+                with progress_lock:
+                    progress.update(1)
+                next_score = queue.get()
     finally:
-        browser.close()
-        playwright.stop()
+        with suppress(Exception):
+            if context is not None:
+                context.close()
+        with suppress(Exception):
+            if browser is not None:
+                browser.close()
 
 
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
     config = parse_args()
     # abc_xml_converter parses global sys.argv internally; clear scraper CLI args first.
     sys.argv = [sys.argv[0]]
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
+    log_path = setup_logging(config.output_dir)
+    logger.info("logging to %s", log_path)
     email, password = get_login_credentials()
+    progress_lock = Lock()
 
-    with ThreadPoolExecutor(max_workers=config.num_workers + 1) as executor:
-        queue: Queue = Queue()
-        futures = [executor.submit(head_worker, config, queue, email, password)]
-        futures.extend(
-            executor.submit(scraper_worker, config, queue, email, password, i + 1)
-            for i in range(config.num_workers)
-        )
-        for future in futures:
-            future.result()
+    with tqdm(
+        total=config.num_scores,
+        desc="Scraped scores",
+        unit="score",
+        dynamic_ncols=True,
+    ) as progress:
+        with ThreadPoolExecutor(max_workers=config.num_workers + 1) as executor:
+            queue: Queue = Queue()
+            futures = [executor.submit(head_worker, config, queue, email, password)]
+            futures.extend(
+                executor.submit(
+                    scraper_worker,
+                    config,
+                    queue,
+                    email,
+                    password,
+                    i + 1,
+                    progress,
+                    progress_lock,
+                )
+                for i in range(config.num_workers)
+            )
+            for future in futures:
+                future.result()
 
 
 if __name__ == "__main__":
