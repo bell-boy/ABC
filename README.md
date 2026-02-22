@@ -2,6 +2,13 @@
 
 tl;dr: pipeline for finetuning a model to convert images of sheet music into ABC notation. 
 
+# installation
+```
+uv sync
+uv run playwright install chrome
+sudo apt-get install poppler-utils # brew install poppler on mac
+```
+
 # data
 data is scraped from [musescore](https://musescore.com/sheetmusic) using a custom scraper. The scraper downloads the sheet music as both ABC and a set of images corresponding to pages
 

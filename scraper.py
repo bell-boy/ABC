@@ -17,6 +17,7 @@ from playwright.sync_api import Page, sync_playwright
 
 LOGIN_URL = "https://www.musescore.com"
 SHEET_MUSIC_URL = "https://musescore.com/sheetmusic/free-download"
+HEADLESS = True
 
 
 @dataclass
@@ -102,7 +103,7 @@ def parse_metadata(meta_str: List[str], link: str) -> Dict[str, object]:
 
 def head_worker(config: ScraperConfig, queue: Queue, email: str, password: str):
     playwright = sync_playwright().start()
-    browser = playwright.chromium.launch(headless=False)
+    browser = playwright.chromium.launch(headless=HEADLESS)
     page = browser.new_page()
     NEXT_URL = SHEET_MUSIC_URL
     current_page = 1
@@ -143,7 +144,7 @@ def head_worker(config: ScraperConfig, queue: Queue, email: str, password: str):
 
 def scraper_worker(config: ScraperConfig, queue: Queue, email: str, password: str):
     playwright = sync_playwright().start()
-    browser = playwright.chromium.launch(headless=False)
+    browser = playwright.chromium.launch(headless=HEADLESS)
     page = browser.new_page()
     try:
         login(page, email, password)
