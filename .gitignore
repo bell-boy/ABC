@@ -11,7 +11,7 @@ wheels/
 
 # Dotfiles
 .env
-**/.DS_STORE
+**/.DS_Store
 
 # Data
 data/
